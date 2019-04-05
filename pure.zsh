@@ -23,6 +23,35 @@
 # \e[K  => clears everything after the cursor on the current line
 # \e[2K => clear everything on the current line
 
+build_preprompt_filler() {
+	# Calculate filler line between left and right segments
+	__zero='%([BSUbfksu]|([FB]|){*})'
+	_separator='―'
+	_left_header="${(j..)preprompt_parts} "
+	_right_header=" %F{white}%D{%-I:%M:%S}%f"
+
+	# do all substitutions and expansions
+	__left=${(e)_left_header}
+	__right=${(e)_right_header}
+	# remove non-printable color characters to compute length correctly
+	_left_width=${#${(S%%)__left//$~__zero/}}
+	_right_width=${#${(S%%)__right//$~__zero/}}
+	# do prompt related expansions
+	_left=${(%)__left}
+	_right=${(%)__right}
+
+	_filler_width=$(( $COLUMNS - 3 - $_left_width - $_right_width ))
+	_filler=""
+	for x ({0..${_filler_width}}) _filler+=${_separator}
+
+	preprompt_parts=(
+		${_left}
+		${_filler}
+		${_right}
+	)
+
+	preprompt_parts=(${(j..)preprompt_parts})
+}
 
 # turns seconds into human readable time
 # 165392 => 1d 21h 56m 32s
@@ -82,20 +111,12 @@ prompt_pure_set_title() {
 }
 
 prompt_pure_preexec() {
-	if [[ -n $prompt_pure_git_fetch_pattern ]]; then
-		# detect when git is performing pull/fetch (including git aliases).
-		local -H MATCH MBEGIN MEND match mbegin mend
-		if [[ $2 =~ (git|hub)\ (.*\ )?($prompt_pure_git_fetch_pattern)(\ .*)?$ ]]; then
-			# we must flush the async jobs to cancel our git fetch in order
-			# to avoid conflicts with the user issued pull / fetch.
-			async_flush_jobs 'prompt_pure'
-		fi
-	fi
-
 	typeset -g prompt_pure_cmd_timestamp=$EPOCHSECONDS
 
 	# shows the current dir and executed command in the title while a process is active
-	prompt_pure_set_title 'ignore-escape' "$PWD:t: $2"
+	setopt EXTENDED_GLOB
+	local cmd="${${2[(wr)^(*=*|sudo|ssh|-*)]}:t}"
+	prompt_pure_set_title 'expand-prompt' "%~ ($cmd)"
 
 	# Disallow python virtualenv from updating the prompt, set it to 12 if
 	# untouched by the user to indicate that Pure modified it. Here we use
@@ -108,23 +129,27 @@ prompt_pure_preprompt_render() {
 
 	# Set color for git branch/dirty status, change color if dirty checking has
 	# been delayed.
-	local git_color=242
-	[[ -n ${prompt_pure_git_last_dirty_check_timestamp+x} ]] && git_color=red
+	local git_color=green
+
+	if [[ -n ${prompt_pure_git_last_dirty_check_timestamp+x} ]]; then
+		git_color=242
+	elif [[ "$prompt_pure_git_dirty" = '*' ]]; then
+		git_color=208
+	fi
 
 	# Initialize the preprompt array.
 	local -a preprompt_parts
 
 	# Set the path.
-	preprompt_parts+=('%F{blue}%~%f')
+	preprompt_parts+=('%F{cyan}%~%f')
 
 	# Add git branch and dirty status info.
 	typeset -gA prompt_pure_vcs_info
 	if [[ -n $prompt_pure_vcs_info[branch] ]]; then
-		preprompt_parts+=("%F{$git_color}"'${prompt_pure_vcs_info[branch]}${prompt_pure_git_dirty}%f')
-	fi
-	# Git pull/push arrows.
-	if [[ -n $prompt_pure_git_arrows ]]; then
-		preprompt_parts+=('%F{cyan}${prompt_pure_git_arrows}%f')
+		_separator="%F{red}|%f"
+		_git_color="%F{$git_color}"
+		_branch='${prompt_pure_vcs_info[branch]}%f'
+		preprompt_parts+=("$_separator$_git_color$_branch")
 	fi
 
 	# Username and machine, if applicable.
@@ -140,6 +165,8 @@ prompt_pure_preprompt_render() {
 		cleaned_ps1=${PROMPT##*${prompt_newline}}
 	fi
 	unset MATCH MBEGIN MEND
+
+	build_preprompt_filler
 
 	# Construct the new prompt with a clean preprompt.
 	local -ah ps1
@@ -157,7 +184,7 @@ prompt_pure_preprompt_render() {
 
 	if [[ $1 == precmd ]]; then
 		# Initial newline, for spaciousness.
-		print
+		# print
 	elif [[ $prompt_pure_last_prompt != $expanded_prompt ]]; then
 		# Redraw the prompt.
 		zle && zle .reset-prompt
@@ -196,32 +223,6 @@ prompt_pure_precmd() {
 
 	# print the preprompt
 	prompt_pure_preprompt_render "precmd"
-
-	if [[ -n $ZSH_THEME ]]; then
-		print "WARNING: Oh My Zsh themes are enabled (ZSH_THEME='${ZSH_THEME}'). Pure might not be working correctly."
-		print "For more information, see: https://github.com/sindresorhus/pure#oh-my-zsh"
-		unset ZSH_THEME  # Only show this warning once.
-	fi
-}
-
-prompt_pure_async_git_aliases() {
-	setopt localoptions noshwordsplit
-	local -a gitalias pullalias
-
-	# list all aliases and split on newline.
-	gitalias=(${(@f)"$(command git config --get-regexp "^alias\.")"})
-	for line in $gitalias; do
-		parts=(${(@)=line})           # split line on spaces
-		aliasname=${parts[1]#alias.}  # grab the name (alias.[name])
-		shift parts                   # remove aliasname
-
-		# check alias for pull or fetch (must be exact match).
-		if [[ $parts =~ ^(.*\ )?(pull|fetch)(\ .*)?$ ]]; then
-			pullalias+=($aliasname)
-		fi
-	done
-
-	print -- ${(j:|:)pullalias}  # join on pipe (for use in regex).
 }
 
 prompt_pure_async_vcs_info() {
@@ -261,53 +262,6 @@ prompt_pure_async_git_dirty() {
 	return $?
 }
 
-prompt_pure_async_git_fetch() {
-	setopt localoptions noshwordsplit
-
-	# set GIT_TERMINAL_PROMPT=0 to disable auth prompting for git fetch (git 2.3+)
-	export GIT_TERMINAL_PROMPT=0
-	# set ssh BachMode to disable all interactive ssh password prompting
-	export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-"ssh"} -o BatchMode=yes"
-
-	# Default return code, indicates Git fetch failure.
-	local fail_code=99
-
-	# Guard against all forms of password prompts. By setting the shell into
-	# MONITOR mode we can notice when a child process prompts for user input
-	# because it will be suspended. Since we are inside an async worker, we
-	# have no way of transmitting the password and the only option is to
-	# kill it. If we don't do it this way, the process will corrupt with the
-	# async worker.
-	setopt localtraps monitor
-
-	# Make sure local HUP trap is unset to allow for signal propagation when
-	# the async worker is flushed.
-	trap - HUP
-
-	trap '
-		# Unset trap to prevent infinite loop
-		trap - CHLD
-		if [[ $jobstates = suspended* ]]; then
-			# Set fail code to password prompt and kill the fetch.
-			fail_code=98
-			kill %%
-		fi
-	' CHLD
-
-	command git -c gc.auto=0 fetch >/dev/null &
-	wait $! || return $fail_code
-
-	unsetopt monitor
-
-	# check arrow status after a successful git fetch
-	prompt_pure_async_git_arrows
-}
-
-prompt_pure_async_git_arrows() {
-	setopt localoptions noshwordsplit
-	command git rev-list --left-right --count HEAD...@'{u}'
-}
-
 prompt_pure_async_tasks() {
 	setopt localoptions noshwordsplit
 
@@ -331,7 +285,6 @@ prompt_pure_async_tasks() {
 		# reset git preprompt variables, switching working tree
 		unset prompt_pure_git_dirty
 		unset prompt_pure_git_last_dirty_check_timestamp
-		unset prompt_pure_git_arrows
 		unset prompt_pure_git_fetch_pattern
 		prompt_pure_vcs_info[branch]=
 		prompt_pure_vcs_info[top]=
@@ -353,15 +306,6 @@ prompt_pure_async_refresh() {
 		# we set the pattern here to avoid redoing the pattern check until the
 		# working three has changed. pull and fetch are always valid patterns.
 		typeset -g prompt_pure_git_fetch_pattern="pull|fetch"
-		async_job "prompt_pure" prompt_pure_async_git_aliases
-	fi
-
-	async_job "prompt_pure" prompt_pure_async_git_arrows
-
-	# do not preform git fetch if it is disabled or in home folder.
-	if (( ${PURE_GIT_PULL:-1} )) && [[ $prompt_pure_vcs_info[top] != $HOME ]]; then
-		# tell worker to do a git fetch
-		async_job "prompt_pure" prompt_pure_async_git_fetch
 	fi
 
 	# if dirty checking is sufficiently fast, tell worker to check it again, or wait for timeout
@@ -371,17 +315,6 @@ prompt_pure_async_refresh() {
 		# check check if there is anything to pull
 		async_job "prompt_pure" prompt_pure_async_git_dirty ${PURE_GIT_UNTRACKED_DIRTY:-1}
 	fi
-}
-
-prompt_pure_check_git_arrows() {
-	setopt localoptions noshwordsplit
-	local arrows left=${1:-0} right=${2:-0}
-
-	(( right > 0 )) && arrows+=${PURE_GIT_DOWN_ARROW:-⇣}
-	(( left > 0 )) && arrows+=${PURE_GIT_UP_ARROW:-⇡}
-
-	[[ -n $arrows ]] || return
-	typeset -g REPLY=$arrows
 }
 
 prompt_pure_async_callback() {
@@ -431,12 +364,6 @@ prompt_pure_async_callback() {
 
 			do_render=1
 			;;
-		prompt_pure_async_git_aliases)
-			if [[ -n $output ]]; then
-				# append custom git aliases to the predefined ones.
-				prompt_pure_git_fetch_pattern+="|$output"
-			fi
-			;;
 		prompt_pure_async_git_dirty)
 			local prev_dirty=$prompt_pure_git_dirty
 			if (( code == 0 )); then
@@ -452,31 +379,6 @@ prompt_pure_async_callback() {
 			# variable. Thus, only upon next rendering of the preprompt will the result appear in a different color.
 			(( $exec_time > 5 )) && prompt_pure_git_last_dirty_check_timestamp=$EPOCHSECONDS
 			;;
-		prompt_pure_async_git_fetch|prompt_pure_async_git_arrows)
-			# prompt_pure_async_git_fetch executes prompt_pure_async_git_arrows
-			# after a successful fetch.
-			case $code in
-				0)
-					local REPLY
-					prompt_pure_check_git_arrows ${(ps:\t:)output}
-					if [[ $prompt_pure_git_arrows != $REPLY ]]; then
-						typeset -g prompt_pure_git_arrows=$REPLY
-						do_render=1
-					fi
-					;;
-				99|98)
-					# Git fetch failed.
-					;;
-				*)
-					# Non-zero exit status from prompt_pure_async_git_arrows,
-					# indicating that there is no upstream configured.
-					if [[ -n $prompt_pure_git_arrows ]]; then
-						unset prompt_pure_git_arrows
-						do_render=1
-					fi
-					;;
-			esac
-			;;
 	esac
 
 	if (( next_pending )); then
@@ -490,18 +392,6 @@ prompt_pure_async_callback() {
 
 prompt_pure_reset_prompt_symbol() {
 	prompt_pure_state[prompt]=${PURE_PROMPT_SYMBOL:-❯}
-}
-
-prompt_pure_update_vim_prompt_widget() {
-	setopt localoptions noshwordsplit
-	prompt_pure_state[prompt]=${${KEYMAP/vicmd/${PURE_PROMPT_VICMD_SYMBOL:-❮}}/(main|viins)/${PURE_PROMPT_SYMBOL:-❯}}
-	zle && zle .reset-prompt
-}
-
-prompt_pure_reset_vim_prompt_widget() {
-	setopt localoptions noshwordsplit
-	prompt_pure_reset_prompt_symbol
-	zle && zle .reset-prompt
 }
 
 prompt_pure_state_setup() {
@@ -587,18 +477,11 @@ prompt_pure_setup() {
 
 	prompt_pure_state_setup
 
-	zle -N prompt_pure_update_vim_prompt_widget
-	zle -N prompt_pure_reset_vim_prompt_widget
-	if (( $+functions[add-zle-hook-widget] )); then
-		add-zle-hook-widget zle-line-finish prompt_pure_reset_vim_prompt_widget
-		add-zle-hook-widget zle-keymap-select prompt_pure_update_vim_prompt_widget
-	fi
-
 	# if a virtualenv is activated, display it in grey
 	PROMPT='%(12V.%F{242}%12v%f .)'
 
 	# prompt turns red if the previous command didn't exit with 0
-	PROMPT+='%(?.%F{magenta}.%F{red})${prompt_pure_state[prompt]}%f '
+	PROMPT+='%(?.%F{green}.%F{red})${prompt_pure_state[prompt]}%f '
 
 	# Store prompt expansion symbols for in-place expansion via (%). For
 	# some reason it does not work without storing them in a variable first.
